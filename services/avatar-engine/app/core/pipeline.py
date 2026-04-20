@@ -55,12 +55,12 @@ class AvatarSession:
         self._running   = False
 
         self.expression  = ExpressionLayer(config)
-        self.musetalk    = MuseTalkInference(config)
-        self.audio_enc   = AudioEncoder(config)
+        self.musetalk    = None   # set by AvatarPipeline.create_session()
+        self.audio_enc   = None   # set by AvatarPipeline.create_session()
 
         # Audio queue: chunks arrive from Redis, get consumed by render loop
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=30)
-        self._idle_audio = self._make_silence_features()
+        self._idle_audio = None   # computed in initialize() after encoder is assigned
 
     def _make_silence_features(self) -> np.ndarray:
         """1/FPS worth of silence features for idle state."""
@@ -76,6 +76,9 @@ class AvatarSession:
         face_box = self.musetalk.prepare_face(self._image)
         if face_box is None:
             raise ValueError("MuseTalk face detection failed")
+
+        # Pre-compute silence features now that audio_enc is assigned
+        self._idle_audio = self._make_silence_features()
 
         logger.info(f"Session {self.session_id} initialized")
 

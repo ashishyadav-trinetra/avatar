@@ -1,10 +1,9 @@
 import React, { useCallback, useRef, useState } from 'react'
 import { useAvatarStore } from './store/avatarStore'
 import { startSession, endSession } from './utils/api'
-import { useWebRTC } from './hooks/useWebRTC'
+import { useAvatarWS } from './hooks/useAvatarWS'
 import { useLiveKit } from './hooks/useLiveKit'
 import { PhotoUploader } from './components/PhotoUploader'
-import { AvatarVideo } from './components/AvatarVideo'
 import { StatusBadge, MicButton, EndCallButton } from './components/Controls'
 import { TranscriptPanel } from './components/TranscriptPanel'
 
@@ -14,29 +13,24 @@ export default function App() {
     setStatus, setSession, setError, setMuted, setSpeaking, addTranscript, reset,
   } = useAvatarStore()
 
-  const [avatarStream, setAvatarStream] = useState<MediaStream | null>(null)
   const [photoFile, setPhotoFile] = useState<File | null>(null)
-  const livekitRef = useRef<ReturnType<typeof useLiveKit> | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
 
-  // ── WebRTC hook (connected when session is ready) ─────────
-  const webrtc = useWebRTC({
-    offerUrl: session?.webrtcOfferUrl ?? '',
-    onTrack: (stream) => {
-      setAvatarStream(stream)
+  // ── Avatar video via direct WebSocket (replaces flaky WebRTC) ──
+  // Pass canvasRef so the hook resolves the canvas at frame-render time,
+  // not at connect time — avoids null ref when canvas isn't mounted yet.
+  const avatarWS = useAvatarWS({
+    canvasRef,
+    onFirstFrame: () => {
       setStatus('active')
     },
-    onStateChange: (state) => {
-      if (state === 'failed' || state === 'disconnected') {
-        setError('WebRTC connection lost')
-        setStatus('error')
-      }
+    onDisconnect: () => {
+      console.warn('Avatar frames WS disconnected')
     },
   })
 
   // ── LiveKit hook ──────────────────────────────────────────
   const livekit = useLiveKit({
-    url: session?.livekitUrl ?? '',
-    token: session?.livekitToken ?? '',
     onAgentSpeaking: setSpeaking,
     onTranscript: (text, isAgent) => {
       addTranscript(`${isAgent ? '[Avatar]' : '[You]'} ${text}`)
@@ -61,33 +55,33 @@ export default function App() {
         livekitUrl: data.livekit_url,
         webrtcOfferUrl: data.webrtc_offer_url,
       })
-      setStatus('initializing')
+      setStatus('connecting')
 
-      // 2. Connect WebRTC (avatar video)
-      await webrtc.connect()
+      // 2. Connect avatar video via direct WebSocket
+      //    canvasRef is resolved at frame-render time by the hook,
+      //    so it's fine that the visible canvas may not be mounted yet.
+      avatarWS.connect(data.session_id)
 
       // 3. Connect LiveKit (voice pipeline)
-      setStatus('connecting')
-      await livekit.connect()
+      await livekit.connect(data.livekit_url, data.livekit_token)
 
-      // Status transitions to 'active' in onTrack callback
+      // Status transitions to 'active' when first frame arrives
     } catch (e: any) {
       console.error('Session start error:', e)
       setError(e.message || 'Failed to start session')
       setStatus('error')
     }
-  }, [photoFile, webrtc, livekit, setStatus, setSession, setError])
+  }, [photoFile, avatarWS, livekit, setStatus, setSession, setError])
 
   // ── End the session ───────────────────────────────────────
   const handleEnd = useCallback(async () => {
-    webrtc.disconnect()
+    avatarWS.disconnect()
     await livekit.disconnect()
     if (session) {
       await endSession(session.sessionId).catch(console.error)
     }
-    setAvatarStream(null)
     reset()
-  }, [webrtc, livekit, session, reset])
+  }, [avatarWS, livekit, session, reset])
 
   // ── Mic toggle ────────────────────────────────────────────
   const handleMicToggle = useCallback(async () => {
@@ -146,7 +140,7 @@ export default function App() {
             <StatusBadge status={status} />
           </div>
 
-          {/* Avatar circle — photo uploader OR live video */}
+          {/* Avatar circle */}
           <div style={{ width: 220 }}>
             {!isCallActive ? (
               <PhotoUploader
@@ -154,11 +148,41 @@ export default function App() {
                 disabled={status !== 'idle'}
               />
             ) : (
-              <AvatarVideo
-                stream={avatarStream}
-                isSpeaking={isSpeaking}
-                status={status}
-              />
+              <div style={{
+                position: 'relative',
+                width: '100%',
+                aspectRatio: '1',
+                borderRadius: '50%',
+                overflow: 'hidden',
+                background: 'var(--surface)',
+                boxShadow: isSpeaking
+                  ? '0 0 0 3px var(--accent), 0 0 32px rgba(108,99,255,0.4)'
+                  : '0 0 0 2px var(--border)',
+                transition: 'box-shadow 0.3s ease',
+              }}>
+                <canvas
+                  ref={canvasRef}
+                  style={{
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'cover',
+                    display: status === 'active' ? 'block' : 'none',
+                  }}
+                />
+                {status !== 'active' && (
+                  <div style={{
+                    width: '100%', height: '100%',
+                    display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center', gap: 12,
+                  }}>
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="var(--border)" strokeWidth="1">
+                      <circle cx="12" cy="8" r="4"/>
+                      <path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+                    </svg>
+                    <span style={{ color: 'var(--text2)', fontSize: 12 }}>Connecting...</span>
+                  </div>
+                )}
+              </div>
             )}
           </div>
 

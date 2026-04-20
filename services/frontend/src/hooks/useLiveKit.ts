@@ -3,29 +3,28 @@ import {
   Room,
   RoomEvent,
   Track,
+  RemoteTrack,
+  RemoteTrackPublication,
   Participant,
+  RemoteParticipant,
   TrackPublication,
   DisconnectReason,
 } from 'livekit-client'
 
 interface UseLiveKitOptions {
-  url: string
-  token: string
   onAgentSpeaking?: (speaking: boolean) => void
   onTranscript?: (text: string, isAgent: boolean) => void
   onDisconnect?: () => void
 }
 
 export function useLiveKit({
-  url,
-  token,
   onAgentSpeaking,
   onTranscript,
   onDisconnect,
 }: UseLiveKitOptions) {
   const roomRef = useRef<Room | null>(null)
 
-  const connect = useCallback(async () => {
+  const connect = useCallback(async (url: string, token: string) => {
     const room = new Room({
       adaptiveStream: true,
       dynacast: true,
@@ -51,6 +50,27 @@ export function useLiveKit({
       onAgentSpeaking?.(agentSpeaking)
     })
 
+    // Attach remote audio tracks so the agent's voice plays through speakers
+    room.on(
+      RoomEvent.TrackSubscribed,
+      (track: RemoteTrack, publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+        if (track.kind === Track.Kind.Audio) {
+          const el = track.attach()          // creates <audio> element
+          el.id = `lk-audio-${participant.identity}`
+          document.body.appendChild(el)       // must be in DOM to play
+          console.log(`Attached audio track from ${participant.identity}`)
+        }
+      }
+    )
+
+    // Clean up audio elements when track unsubscribed
+    room.on(
+      RoomEvent.TrackUnsubscribed,
+      (track: RemoteTrack) => {
+        track.detach().forEach((el) => el.remove())
+      }
+    )
+
     // Data channel messages (transcript from agent)
     room.on(RoomEvent.DataReceived, (payload: Uint8Array, participant?: Participant) => {
       try {
@@ -72,7 +92,7 @@ export function useLiveKit({
     await room.localParticipant.setMicrophoneEnabled(true)
 
     return room
-  }, [url, token, onAgentSpeaking, onTranscript, onDisconnect])
+  }, [onAgentSpeaking, onTranscript, onDisconnect])
 
   const disconnect = useCallback(async () => {
     if (roomRef.current) {

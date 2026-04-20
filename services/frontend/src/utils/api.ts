@@ -27,7 +27,13 @@ export async function startSession(photoFile: File): Promise<StartSessionRespons
     const err = await res.text()
     throw new Error(`Session start failed: ${err}`)
   }
-  return res.json()
+  const data: StartSessionResponse = await res.json()
+
+  // The API gateway returns a Docker-internal URL (e.g. http://webrtc-bridge:8002/...)
+  // which the browser can't reach. Replace with the browser-accessible VITE_WEBRTC_URL.
+  data.webrtc_offer_url = `${WEBRTC_URL}/webrtc/offer/${data.session_id}`
+
+  return data
 }
 
 export async function endSession(sessionId: string): Promise<void> {

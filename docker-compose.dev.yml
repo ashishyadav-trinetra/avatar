@@ -88,6 +88,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - AVATAR_ENGINE_URL=http://avatar-engine:8001
       - STUN_SERVER=stun:stun.l.google.com:19302
+      - ANNOUNCE_IP=127.0.0.1
       - LOG_LEVEL=debug
     depends_on:
       avatar-engine:
@@ -157,5 +158,6 @@ services:
       - VITE_API_URL=http://localhost:8000
       - VITE_WS_URL=ws://localhost:8000
       - VITE_WEBRTC_URL=http://localhost:8002
+      - VITE_AVATAR_ENGINE_WS=ws://localhost:8001
     depends_on:
       - api-gateway

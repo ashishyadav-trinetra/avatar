@@ -176,9 +176,23 @@ async def entrypoint(ctx: JobContext):
     )
 
     await session.start(agent=agent, room=ctx.room)
+    logger.info(f"AgentSession started for room: {ctx.room.name}")
 
-    # Keep alive until room disconnects
-    await ctx.wait_for_disconnect()
+    # In livekit-agents 1.x, the framework manages process lifetime.
+    # session.start() registers everything; we keep the coroutine alive
+    # by listening for the room disconnect event. The framework cancels
+    # this task when the room closes.
+    disconnect_future = asyncio.Future()
+
+    @ctx.room.on("disconnected")
+    def _on_disconnect(*args):
+        if not disconnect_future.done():
+            disconnect_future.set_result(True)
+
+    try:
+        await disconnect_future
+    except asyncio.CancelledError:
+        pass
 
     logger.info(f"Agent disconnecting from room: {ctx.room.name}")
     await redis.close()

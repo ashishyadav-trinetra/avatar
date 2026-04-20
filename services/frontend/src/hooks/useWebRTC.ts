@@ -2,15 +2,14 @@ import { useRef, useCallback, useEffect } from 'react'
 import { sendWebRTCOffer } from '../utils/api'
 
 interface UseWebRTCOptions {
-  offerUrl: string
   onTrack?: (stream: MediaStream) => void
   onStateChange?: (state: RTCPeerConnectionState) => void
 }
 
-export function useWebRTC({ offerUrl, onTrack, onStateChange }: UseWebRTCOptions) {
+export function useWebRTC({ onTrack, onStateChange }: UseWebRTCOptions) {
   const pcRef = useRef<RTCPeerConnection | null>(null)
 
-  const connect = useCallback(async () => {
+  const connect = useCallback(async (offerUrl: string) => {
     // Tear down any existing connection
     if (pcRef.current) {
       pcRef.current.close()
@@ -23,9 +22,13 @@ export function useWebRTC({ offerUrl, onTrack, onStateChange }: UseWebRTCOptions
 
     // When avatar video track arrives
     pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        onTrack?.(event.streams[0])
-      }
+      // aiortc doesn't associate tracks with MediaStreams,
+      // so event.streams may be empty. Create one from the track.
+      const stream = (event.streams && event.streams[0])
+        ? event.streams[0]
+        : new MediaStream([event.track])
+      console.log('WebRTC ontrack:', event.track.kind, 'stream tracks:', stream.getTracks().length)
+      onTrack?.(stream)
     }
 
     pc.onconnectionstatechange = () => {
@@ -63,7 +66,7 @@ export function useWebRTC({ offerUrl, onTrack, onStateChange }: UseWebRTCOptions
     })
 
     await pc.setRemoteDescription(new RTCSessionDescription(answer))
-  }, [offerUrl, onTrack, onStateChange])
+  }, [onTrack, onStateChange])
 
   const disconnect = useCallback(() => {
     pcRef.current?.close()

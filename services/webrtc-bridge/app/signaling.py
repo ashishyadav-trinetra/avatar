@@ -12,6 +12,7 @@ which shows the live lip-synced avatar.
 """
 import asyncio
 import fractions
+import re
 import time
 from typing import Optional
 
@@ -36,6 +37,37 @@ router = APIRouter()
 
 # Track all active peer connections for cleanup
 _peer_connections: dict[str, RTCPeerConnection] = {}
+
+
+def _rewrite_sdp_ip(sdp: str, announce_ip: str) -> str:
+    """
+    Replace Docker-internal IPs in ICE candidates with the host-accessible IP.
+    In Docker, aiortc advertises 172.x.x.x which the browser can't reach.
+    Since we map UDP ports in docker-compose, replacing the IP with 127.0.0.1
+    lets the browser connect through the port mapping.
+    """
+    if not announce_ip:
+        return sdp
+
+    # Match ICE candidate lines and replace the candidate IP
+    # Format: a=candidate:... <priority> <ip> <port> ...
+    # Also handle c= connection lines
+    lines = []
+    for line in sdp.split("\r\n"):
+        if line.startswith("a=candidate:"):
+            # Replace private Docker IPs (172.x.x.x, 10.x.x.x, 192.168.x.x)
+            line = re.sub(
+                r'(\d+)\s+(172\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)\s+(\d+)\s+typ\s+host',
+                rf'\1 {announce_ip} \3 typ host',
+                line,
+            )
+        elif line.startswith("c=IN IP4 "):
+            ip_in_line = line.split()[-1]
+            if ip_in_line.startswith(("172.", "10.", "192.168.")):
+                line = f"c=IN IP4 {announce_ip}"
+        lines.append(line)
+
+    return "\r\n".join(lines)
 
 
 # ── Pydantic models ───────────────────────────────────────────
@@ -187,10 +219,32 @@ async def webrtc_offer(session_id: str, offer: OfferRequest):
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
+    # Wait for ICE gathering to complete so the answer SDP contains
+    # all ICE candidates. Without this, the browser gets an answer
+    # with no candidates and ICE fails.
+    if pc.iceGatheringState != "complete":
+        ice_done = asyncio.Event()
+
+        @pc.on("icegatheringstatechange")
+        def _on_ice_gathering():
+            if pc.iceGatheringState == "complete":
+                ice_done.set()
+
+        try:
+            await asyncio.wait_for(ice_done.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"ICE gathering timed out for session {session_id}")
+
     logger.info(f"WebRTC session established: {session_id}")
 
+    # Rewrite Docker-internal IPs in SDP so browser can reach us
+    sdp = pc.localDescription.sdp
+    if settings.ANNOUNCE_IP:
+        sdp = _rewrite_sdp_ip(sdp, settings.ANNOUNCE_IP)
+        logger.debug(f"Rewrote SDP candidates to use {settings.ANNOUNCE_IP}")
+
     return AnswerResponse(
-        sdp=pc.localDescription.sdp,
+        sdp=sdp,
         type=pc.localDescription.type,
     )
 
