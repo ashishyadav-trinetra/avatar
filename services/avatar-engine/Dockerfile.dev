@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────
+#  Avatar Engine — DEV Dockerfile (CPU only, no CUDA)
+#  Used by docker-compose.dev.yml
+#  DEV_MODE=true bypasses MuseTalk — uses stub renderer instead
+# ─────────────────────────────────────────────────────────────
+FROM python:3.10-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ wget curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install CPU-only torch first (much smaller — ~800MB vs 4GB)
+RUN pip install --no-cache-dir \
+    torch==2.1.0+cpu torchvision==0.16.0+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.dev.txt .
+RUN pip install --no-cache-dir -r requirements.dev.txt
+
+# MediaPipe
+RUN pip install --no-cache-dir mediapipe==0.10.9
+
+COPY . .
+RUN mkdir -p /app/models /app/uploads
+
+EXPOSE 8001
+
+# Dev: uvicorn with --reload so code changes auto-restart
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]

@@ -1,0 +1,161 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════
+#  AI Avatar POC — DEVELOPMENT compose
+#  docker compose -f docker-compose.dev.yml up
+#
+#  Key differences from prod:
+#  ─ avatar-engine runs in CPU/MOCK mode (no GPU required)
+#  ─ All services hot-reload on code changes via volume mounts
+#  ─ Frontend runs Vite dev server (HMR) instead of nginx build
+#  ─ Redis port exposed for local inspection
+#  ─ No GPU device reservation
+#  ─ avatar-engine bypasses MuseTalk model loading (stub frames)
+#  ─ Lighter resource limits
+# ═══════════════════════════════════════════════════════════════
+
+networks:
+  avatar-net:
+    driver: bridge
+
+volumes:
+  models:
+    driver: local
+
+services:
+
+  # ── Redis ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [avatar-net]
+    ports:
+      - "6379:6379"          # exposed in dev for local inspection
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Avatar Engine (CPU / DEV MODE) ────────────────────────
+  # Runs in DEV_MODE=true which bypasses MuseTalk model loading.
+  # Instead it generates animated placeholder frames using only
+  # MediaPipe + OpenCV so you can test the full pipeline without a GPU.
+  avatar-engine:
+    build:
+      context: ./services/avatar-engine
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    networks: [avatar-net]
+    ports:
+      - "8001:8001"
+    volumes:
+      - models:/app/models
+      - ./services/avatar-engine:/app:rw  # hot reload
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MODEL_DIR=/app/models
+      - DEVICE=cpu
+      - DEV_MODE=true               # ← skips MuseTalk, uses stub renderer
+      - FPS_TARGET=10               # lower fps on cpu
+      - FACE_SIZE=256
+      - USE_HALF_PRECISION=false
+      - ENABLE_UPSCALER=false
+      - LOG_LEVEL=debug
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── WebRTC Bridge ─────────────────────────────────────────
+  webrtc-bridge:
+    build:
+      context: ./services/webrtc-bridge
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [avatar-net]
+    ports:
+      - "8002:8002"
+      - "50000-50010:50000-50010/udp"
+    volumes:
+      - ./services/webrtc-bridge:/app:rw   # hot reload
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - AVATAR_ENGINE_URL=http://avatar-engine:8001
+      - STUN_SERVER=stun:stun.l.google.com:19302
+      - LOG_LEVEL=debug
+    depends_on:
+      avatar-engine:
+        condition: service_healthy
+
+  # ── LiveKit Agent ─────────────────────────────────────────
+  livekit-agent:
+    build:
+      context: ./services/livekit-agent
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [avatar-net]
+    volumes:
+      - ./services/livekit-agent:/app:rw   # hot reload
+    environment:
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_URL=redis://redis:6379
+      - AGENT_SYSTEM_PROMPT=${AGENT_SYSTEM_PROMPT:-You are a helpful AI assistant. Be concise and conversational.}
+      - STT_PROVIDER=${STT_PROVIDER:-openai}
+      - TTS_PROVIDER=${TTS_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LOG_LEVEL=debug
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── API Gateway ───────────────────────────────────────────
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [avatar-net]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./services/api-gateway:/app:rw     # hot reload
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - WEBRTC_BRIDGE_URL=http://webrtc-bridge:8002
+      - AVATAR_ENGINE_URL=http://avatar-engine:8001
+      - UPLOAD_DIR=/tmp/uploads
+      - LOG_LEVEL=debug
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Frontend (Vite dev server with HMR) ───────────────────
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    networks: [avatar-net]
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./services/frontend:/app:rw
+      - /app/node_modules             # don't override container node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000
+      - VITE_WEBRTC_URL=http://localhost:8002
+    depends_on:
+      - api-gateway

@@ -1,0 +1,19 @@
+# ─────────────────────────────────────────────────────────────
+#  Frontend — DEV Dockerfile
+#  Runs Vite dev server with hot module replacement (HMR)
+#  Source is mounted as a volume — changes reflect instantly
+# ─────────────────────────────────────────────────────────────
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install deps into the image layer (not the mounted volume)
+COPY package*.json ./
+RUN npm ci
+
+# Source files will be mounted at /app by docker-compose volume
+# node_modules stays in the container layer (not overridden by mount)
+
+EXPOSE 3000
+
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]

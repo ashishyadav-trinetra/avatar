@@ -1,0 +1,16 @@
+# LiveKit Agents framework + plugins
+livekit-agents[openai,deepgram,silero]==0.8.11
+livekit==0.17.5
+
+# Redis (publish audio PCM + intent)
+redis[hiredis]==5.0.4
+
+# Audio processing
+numpy==1.26.4
+soundfile==0.12.1
+librosa==0.10.2
+
+# Utils
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+loguru==0.7.2

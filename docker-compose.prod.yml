@@ -1,0 +1,153 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════
+#  AI Avatar POC — PRODUCTION compose
+#  docker compose -f docker-compose.prod.yml up -d
+#
+#  Requirements:
+#  ─ NVIDIA GPU with ≥10GB VRAM (RTX 3080 min, RTX 4090 recommended)
+#  ─ nvidia-docker2 installed (see README)
+#  ─ CUDA 11.8+ driver (≥525)
+#  ─ All credentials in .env.prod
+# ═══════════════════════════════════════════════════════════════
+
+networks:
+  avatar-net:
+    driver: bridge
+
+volumes:
+  models:
+    driver: local
+
+services:
+
+  # ── Redis ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: always
+    networks: [avatar-net]
+    # NOT exposed externally in prod
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Avatar Engine (GPU) ───────────────────────────────────
+  avatar-engine:
+    build:
+      context: ./services/avatar-engine
+      dockerfile: Dockerfile
+    restart: always
+    networks: [avatar-net]
+    volumes:
+      - models:/app/models
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MODEL_DIR=/app/models
+      - DEVICE=cuda
+      - DEV_MODE=false
+      - FPS_TARGET=${FPS_TARGET:-25}
+      - FACE_SIZE=${FACE_SIZE:-256}
+      - USE_HALF_PRECISION=true
+      - ENABLE_UPSCALER=${ENABLE_UPSCALER:-false}
+      - BATCH_SIZE=${BATCH_SIZE:-4}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 90s     # models take time to load
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── WebRTC Bridge ─────────────────────────────────────────
+  webrtc-bridge:
+    build:
+      context: ./services/webrtc-bridge
+      dockerfile: Dockerfile
+    restart: always
+    networks: [avatar-net]
+    ports:
+      - "8002:8002"
+      - "50000-50020:50000-50020/udp"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - AVATAR_ENGINE_URL=http://avatar-engine:8001
+      - STUN_SERVER=${STUN_SERVER:-stun:stun.l.google.com:19302}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      avatar-engine:
+        condition: service_healthy
+
+  # ── LiveKit Agent ─────────────────────────────────────────
+  livekit-agent:
+    build:
+      context: ./services/livekit-agent
+      dockerfile: Dockerfile
+    restart: always
+    networks: [avatar-net]
+    environment:
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-}
+      - REDIS_URL=redis://redis:6379
+      - AGENT_SYSTEM_PROMPT=${AGENT_SYSTEM_PROMPT:-You are a helpful AI assistant. Be concise and conversational.}
+      - STT_PROVIDER=${STT_PROVIDER:-deepgram}
+      - TTS_PROVIDER=${TTS_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── API Gateway ───────────────────────────────────────────
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    restart: always
+    networks: [avatar-net]
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - WEBRTC_BRIDGE_URL=http://webrtc-bridge:8002
+      - AVATAR_ENGINE_URL=http://avatar-engine:8001
+      - UPLOAD_DIR=/tmp/uploads
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Frontend (nginx, pre-built) ───────────────────────────
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+        - VITE_WS_URL=${VITE_WS_URL:-ws://localhost:8000}
+        - VITE_WEBRTC_URL=${VITE_WEBRTC_URL:-http://localhost:8002}
+    restart: always
+    networks: [avatar-net]
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-gateway
