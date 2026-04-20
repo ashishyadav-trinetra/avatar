@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Install deps into the image layer (not the mounted volume)
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 # Source files will be mounted at /app by docker-compose volume
 # node_modules stays in the container layer (not overridden by mount)

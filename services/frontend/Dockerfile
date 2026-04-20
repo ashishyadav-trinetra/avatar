@@ -11,7 +11,7 @@ ENV VITE_WEBRTC_URL=$VITE_WEBRTC_URL
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 COPY . .
 RUN npm run build
 

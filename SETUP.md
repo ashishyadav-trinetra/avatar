@@ -194,12 +194,19 @@ Sign up for:
 
 ### Step 2 — Clone and configure
 
+**Linux / Mac:**
 ```bash
 git clone <your-repo-url>
 cd avatar-poc
-
-# Creates .env from the template
 cp .env.example .env
+```
+
+**Windows PowerShell:**
+```powershell
+git clone <your-repo-url>
+cd avatar-poc
+copy .env.example .env
+notepad .env
 ```
 
 Open `.env` and fill in **only these 4 lines** to get started:
@@ -215,8 +222,14 @@ Leave everything else at defaults.
 
 ### Step 3 — Build dev images
 
+**Linux / Mac:**
 ```bash
 make setup-dev
+```
+
+**Windows PowerShell:**
+```powershell
+docker compose -f docker-compose.dev.yml build
 ```
 
 This builds the CPU-only Docker images (~3–5 minutes, downloads ~1GB of Python packages).
@@ -224,11 +237,22 @@ It does NOT download the 3.5GB model weights — those are only needed for prod.
 
 ### Step 4 — Start
 
+**Linux / Mac:**
 ```bash
 make dev
 ```
 
+**Windows PowerShell:**
+```powershell
+docker compose -f docker-compose.dev.yml up -d
+```
+
 Services start up. Open **http://localhost:3000**
+
+**Windows — open browser automatically:**
+```powershell
+Start-Process "http://localhost:3000"
+```
 
 ### Step 5 — Test it
 
@@ -254,6 +278,7 @@ Everything else is real and identical to prod:
 
 ### Useful dev commands
 
+**Linux / Mac (make):**
 ```bash
 make dev-logs                    # watch all service output
 make logs-avatar-engine          # watch just avatar engine
@@ -263,9 +288,37 @@ make dev-stop                    # stop everything
 make dev-restart                 # restart everything
 ```
 
+**Windows PowerShell (direct Docker commands):**
+```powershell
+# Watch all logs
+docker compose -f docker-compose.dev.yml logs -f
+
+# Watch one service
+docker compose -f docker-compose.dev.yml logs -f avatar-engine
+docker compose -f docker-compose.dev.yml logs -f livekit-agent
+docker compose -f docker-compose.dev.yml logs -f webrtc-bridge
+docker compose -f docker-compose.dev.yml logs -f api-gateway
+
+# Bash into a container
+docker compose -f docker-compose.dev.yml exec avatar-engine /bin/bash
+
+# Stop everything
+docker compose -f docker-compose.dev.yml down
+
+# Restart everything
+docker compose -f docker-compose.dev.yml down
+docker compose -f docker-compose.dev.yml up -d
+
+# Check all service statuses
+docker compose -f docker-compose.dev.yml ps
+```
+
 ---
 
 ## 4. Production Setup (GPU Required)
+
+> **Note:** Production runs on Linux (Ubuntu 22.04). The GPU machine should be Linux, not Windows.
+> If you're using a cloud GPU (RunPod, Lambda Labs), you SSH into a Linux machine and run the Linux commands below.
 
 ### Step 1 — Install nvidia-docker2
 
@@ -285,7 +338,7 @@ docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
 
 You should see your GPU listed. If not, check your NVIDIA driver version:
 ```bash
-nvidia-smi   # must show driver ≥ 525
+nvidia-smi   # must show driver >= 525
 ```
 
 ### Step 2 — Create prod env file
@@ -313,65 +366,109 @@ FACE_SIZE=256
 ENABLE_UPSCALER=false
 ```
 
-### Step 3 — Run prod setup
+### Step 3 — Download models and build
 
+**Linux / Mac (make):**
 ```bash
 make setup-prod
 ```
 
-This does three things:
-1. Verifies GPU is accessible
-2. Downloads all model weights (~3.5GB) into `./models/`
-3. Builds production Docker images (~10–15 minutes)
+**Linux / Mac (direct commands — same as make setup-prod):**
+```bash
+bash scripts/download_models.sh
+docker compose -f docker-compose.prod.yml --env-file .env.prod build
+```
+
+This does:
+1. Downloads all model weights (~3.5GB) into `./models/`
+2. Builds production Docker images (~10–15 minutes)
 
 Model download breakdown:
 ```
 models/
 ├── musetalk/
-│   ├── pytorch_model.bin        ~1.4 GB  ← MuseTalk UNet weights
-│   ├── musetalk.json            ~2 KB    ← UNet architecture config
+│   ├── pytorch_model.bin        ~1.4 GB  <- MuseTalk UNet weights
+│   ├── musetalk.json            ~2 KB    <- UNet architecture config
 │   ├── sd-vae-ft-mse/
-│   │   ├── diffusion_pytorch_model.bin  ~850 MB  ← VAE weights
+│   │   ├── diffusion_pytorch_model.bin  ~850 MB  <- VAE weights
 │   │   └── config.json
 │   ├── whisper/
-│   │   ├── pytorch_model.bin    ~150 MB  ← Whisper-tiny audio encoder
+│   │   ├── pytorch_model.bin    ~150 MB  <- Whisper-tiny audio encoder
 │   │   └── config.json
 │   └── face-parse-bisent/
-│       └── 79999_iter.pth       ~50 MB   ← Face parsing
+│       └── 79999_iter.pth       ~50 MB   <- Face parsing
 ├── dwpose/
-│   └── dw-ll_ucoco_384.pth     ~280 MB  ← Body/face pose detection
+│   └── dw-ll_ucoco_384.pth     ~280 MB  <- Body/face pose detection
 └── gfpgan/
-    └── GFPGANv1.4.pth          ~350 MB  ← HD face upscaler (optional)
+    └── GFPGANv1.4.pth          ~350 MB  <- HD face upscaler (optional)
 
 Total: ~3.0–3.5 GB
 ```
 
 ### Step 4 — Start production
 
+**Linux / Mac (make):**
 ```bash
 make prod
 ```
 
-The avatar-engine takes **60–90 seconds** to start (loading GPU models into VRAM).
-Watch progress:
+**Linux / Mac (direct commands):**
 ```bash
-make prod-logs
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 ```
 
-When you see `Avatar Engine ready ✓` in the logs, open **http://localhost:3000**
+The avatar-engine takes **60–90 seconds** to start (loading GPU models into VRAM).
+
+**Watch progress:**
+
+```bash
+# make
+make prod-logs
+
+# direct
+docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f avatar-engine
+```
+
+When you see `Avatar Engine ready` in the logs, open **http://localhost:3000**
+
+### Useful prod commands
+
+**Linux / Mac (make):**
+```bash
+make prod-stop         # stop prod stack
+make prod-restart      # restart prod stack
+make prod-logs         # tail all prod logs
+make logs-avatar-engine # tail avatar engine only
+```
+
+**Linux / Mac (direct commands):**
+```bash
+# Stop
+docker compose -f docker-compose.prod.yml --env-file .env.prod down
+
+# Restart
+docker compose -f docker-compose.prod.yml --env-file .env.prod down
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+# All logs
+docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f
+
+# One service log
+docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f avatar-engine
+```
 
 ### Production on a cloud GPU (RunPod / Lambda Labs)
 
 1. Create instance with NVIDIA GPU (RTX 4090 recommended)
 2. Template: `RunPod PyTorch 2.1` or `Ubuntu 22.04 + CUDA 11.8`
 3. Open ports: `3000`, `8000`, `8002`, `50000-50020/UDP`
-4. SSH in, clone repo, run `make setup-prod`
+4. SSH in, clone repo, run the Linux commands above
 5. Update `.env.prod`:
    ```env
    VITE_API_URL=http://YOUR_SERVER_IP:8000
    VITE_WEBRTC_URL=http://YOUR_SERVER_IP:8002
    ```
-6. `make prod`
+6. Start with `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d`
 
 ---
 

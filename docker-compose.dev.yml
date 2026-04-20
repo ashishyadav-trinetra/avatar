@@ -76,7 +76,7 @@ services:
   webrtc-bridge:
     build:
       context: ./services/webrtc-bridge
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     ports:
@@ -97,7 +97,7 @@ services:
   livekit-agent:
     build:
       context: ./services/livekit-agent
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     volumes:
@@ -121,7 +121,7 @@ services:
   api-gateway:
     build:
       context: ./services/api-gateway
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     ports:

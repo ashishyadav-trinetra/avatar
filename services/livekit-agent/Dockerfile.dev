@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────
+#  LiveKit Agent — DEV Dockerfile
+#  Hot reload via volume mount
+# ─────────────────────────────────────────────────────────────
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && apt-get install -y ffmpeg gcc curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download livekit agent model files
+RUN python -m livekit.agents download-files || true
+
+COPY . .
+
+CMD ["python", "-m", "app.main", "start"]

@@ -1,6 +1,6 @@
 # LiveKit Agents framework + plugins
-livekit-agents[openai,deepgram,silero]==0.8.11
-livekit==0.17.5
+livekit-agents[openai,deepgram,silero]>=0.8.0
+livekit>=0.17.0
 
 # Redis (publish audio PCM + intent)
 redis[hiredis]==5.0.4

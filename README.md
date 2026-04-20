@@ -24,11 +24,13 @@ User speaks → LiveKit Agent (STT→LLM→TTS) → audio PCM → Redis
 | nvidia-docker2      | required             | required            |
 | OS                  | Ubuntu 22.04         | Ubuntu 22.04        |
 
+> **Windows users:** `make` commands may not work. See the [Windows Commands](#windows-commands-no-make-needed) section below for direct Docker equivalents.
+
 ---
 
 ## First-Time Setup
 
-### 1. Install nvidia-docker2 (if not already installed)
+### 1. Install nvidia-docker2 (Linux/prod only)
 
 ```bash
 distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
@@ -44,7 +46,8 @@ sudo systemctl restart docker
 ```bash
 git clone <your-repo>
 cd avatar-poc
-cp .env.example .env
+cp .env.example .env        # Linux/Mac
+copy .env.example .env      # Windows PowerShell
 ```
 
 Edit `.env` with your credentials:
@@ -55,20 +58,18 @@ LIVEKIT_API_SECRET=your_api_secret
 OPENAI_API_KEY=sk-...
 ```
 
-### 3. Run setup (downloads models + builds images)
+### 3. Build and start (Linux/Mac)
 
 ```bash
-make setup
+make setup-dev   # first time — builds images
+make dev         # start the stack
 ```
 
-This will:
-- Download ~3.5 GB of model weights into `./models/`
-- Build all Docker images
+### 3. Build and start (Windows PowerShell)
 
-### 4. Start
-
-```bash
-make run
+```powershell
+docker compose -f docker-compose.dev.yml build
+docker compose -f docker-compose.dev.yml up -d
 ```
 
 Open **http://localhost:3000**
@@ -78,9 +79,9 @@ Open **http://localhost:3000**
 ## Usage
 
 1. Open the app in your browser
-2. Upload a front-facing photo (ideally 512×512+, good lighting)
+2. Upload a front-facing photo (ideally 512x512+, good lighting)
 3. Click **Start Call**
-4. Wait ~5 seconds for avatar to initialize
+4. Wait ~10 seconds for avatar to initialize
 5. Speak — the avatar responds with lip-sync and expression
 
 ---
@@ -100,14 +101,66 @@ Open **http://localhost:3000**
 
 ## Common Commands
 
+### Linux / Mac (make)
+
 ```bash
-make logs               # tail all logs
-make logs-avatar-engine # tail one service
-make stop               # stop everything
-make restart            # restart everything
-make gpu-check          # verify GPU is accessible
+# Dev
+make dev                 # start dev stack
+make dev-stop            # stop dev stack
+make dev-logs            # tail all logs
+make dev-restart         # restart everything
+make logs-avatar-engine  # tail one service
 make shell-avatar-engine # bash into container
+
+# Prod
+make prod                # start prod stack
+make prod-stop           # stop prod stack
+make prod-logs           # tail prod logs
+make gpu-check           # verify GPU accessible
 ```
+
+### Windows PowerShell (direct Docker commands)
+
+```powershell
+# Dev — start / stop / restart
+docker compose -f docker-compose.dev.yml up -d
+docker compose -f docker-compose.dev.yml down
+docker compose -f docker-compose.dev.yml down; docker compose -f docker-compose.dev.yml up -d
+
+# Dev — logs
+docker compose -f docker-compose.dev.yml logs -f
+docker compose -f docker-compose.dev.yml logs -f avatar-engine
+docker compose -f docker-compose.dev.yml logs -f livekit-agent
+
+# Dev — shell into a container
+docker compose -f docker-compose.dev.yml exec avatar-engine /bin/bash
+
+# Prod — start / stop
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+docker compose -f docker-compose.prod.yml --env-file .env.prod down
+docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f
+```
+
+---
+
+## Windows Commands (no make needed)
+
+If `make` is unavailable on Windows, every operation maps to a direct Docker command:
+
+| What you want to do | Windows PowerShell command |
+|---|---|
+| First-time dev build | `docker compose -f docker-compose.dev.yml build` |
+| Start dev stack | `docker compose -f docker-compose.dev.yml up -d` |
+| Stop dev stack | `docker compose -f docker-compose.dev.yml down` |
+| Watch all logs | `docker compose -f docker-compose.dev.yml logs -f` |
+| Watch one service log | `docker compose -f docker-compose.dev.yml logs -f avatar-engine` |
+| Restart everything | `docker compose -f docker-compose.dev.yml down; docker compose -f docker-compose.dev.yml up -d` |
+| Bash into container | `docker compose -f docker-compose.dev.yml exec avatar-engine /bin/bash` |
+| Check running services | `docker compose -f docker-compose.dev.yml ps` |
+| First-time prod build | `docker compose -f docker-compose.prod.yml --env-file .env.prod build` |
+| Start prod stack | `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d` |
+| Stop prod stack | `docker compose -f docker-compose.prod.yml --env-file .env.prod down` |
+| Watch prod logs | `docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f` |
 
 ---
 
@@ -127,8 +180,6 @@ t=50ms   Browser receives frame → renders in <video>
 
 ### Expression layer states
 
-The LLM response is classified into one of:
-
 | State      | Trigger keywords           | Motion                            |
 |------------|----------------------------|-----------------------------------|
 | `neutral`  | (default)                  | Subtle idle drift                 |
@@ -142,17 +193,12 @@ The LLM response is classified into one of:
 
 ## Swapping TTS / STT / LLM
 
-All providers are configured via `.env`:
+All providers configured via `.env`:
 
 ```env
-# TTS options: openai | elevenlabs
-TTS_PROVIDER=openai
-
-# STT options: deepgram | openai
-STT_PROVIDER=deepgram
-
-# LLM options: gpt-4o-mini | gpt-4o | claude-3-5-haiku
-LLM_MODEL=gpt-4o-mini
+TTS_PROVIDER=openai      # openai | elevenlabs
+STT_PROVIDER=deepgram    # deepgram | openai
+LLM_MODEL=gpt-4o-mini   # gpt-4o-mini | gpt-4o | claude-3-5-haiku
 ```
 
 ---
@@ -161,37 +207,36 @@ LLM_MODEL=gpt-4o-mini
 
 1. Create a pod with **NVIDIA RTX 4090**, template: `RunPod PyTorch 2.1`
 2. Expose ports: 3000, 8000, 8002, 50000-50020/UDP
-3. SSH in, clone repo, follow setup above
-4. Set `VITE_API_URL` and `VITE_WEBRTC_URL` to your pod's public IP
-
----
-
-## Integrating Vapi / Retell (later)
-
-The `api-gateway` exposes a stub webhook at `POST /api/webhook/vapi`.
-When you're ready to replace the LiveKit agent with Vapi:
-
-1. Configure Vapi to POST audio chunks to `/api/webhook/vapi?session_id=<id>`
-2. The gateway forwards PCM to Redis → avatar engine picks it up
-3. Disable the `livekit-agent` service in `docker-compose.yml`
+3. SSH in, clone repo
+4. Set credentials in `.env.prod`
+5. Run: `bash scripts/download_models.sh`
+6. Run: `docker compose -f docker-compose.prod.yml --env-file .env.prod build`
+7. Run: `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d`
 
 ---
 
 ## Troubleshooting
 
 **No face detected on upload**
-→ Use a clear front-facing photo, good lighting, face taking up >40% of frame
-
-**GPU OOM error**
-→ Set `USE_HALF_PRECISION=true` in `.env` (default)
-→ Reduce `FACE_SIZE=256` (default, don't increase on small GPUs)
-→ Reduce `BATCH_SIZE=2`
+→ Use a clear front-facing photo, face taking up >40% of frame
 
 **WebRTC video not appearing**
-→ Check browser allows camera/mic permissions
-→ Verify ports 50000-50020/UDP are open on your firewall
-→ Check `make logs-webrtc-bridge`
+→ Check browser mic/camera permissions
+→ Verify ports 50000-50020/UDP are open
+→ Logs: `docker compose -f docker-compose.dev.yml logs -f webrtc-bridge`
 
 **LiveKit agent not responding**
 → Verify `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` in `.env`
-→ Check `make logs-livekit-agent`
+→ Logs: `docker compose -f docker-compose.dev.yml logs -f livekit-agent`
+
+**GPU OOM error (prod)**
+→ Set `USE_HALF_PRECISION=true` in `.env.prod`
+→ Set `BATCH_SIZE=2`
+→ Check: `nvidia-smi`
+
+**"DEV MODE" watermark showing**
+→ This is expected in dev. Disappears in prod when `DEV_MODE=false`
+
+**make not working on Windows**
+→ Use the direct Docker commands from the Windows Commands table above
+→ Or run: `winget install GnuWin32.Make` then add `C:\Program Files (x86)\GnuWin32\bin` to PATH

@@ -1,89 +1,49 @@
 """
-LiveKit Agent — Main Entry Point
-──────────────────────────────────
-Uses livekit-agents framework to run:
-  STT (Deepgram / OpenAI Whisper)
-  → LLM (GPT-4o-mini / GPT-4o)
-  → TTS (OpenAI / ElevenLabs)
+LiveKit Agent — Main Entry Point (LiveKit Agents 1.x)
+───────────────────────────────────────────────────────
+Uses the modern AgentSession + Agent API.
 
+Pipeline: VAD → STT → LLM → TTS
 Additionally:
-  - Intercepts TTS audio chunks and publishes raw PCM to Redis
-    so the avatar-engine can drive MuseTalk lip-sync
-  - Classifies each LLM response and publishes motion state to Redis
-    so the avatar-engine expression layer reacts
+  - Intercepts TTS audio and publishes raw PCM to Redis
+    so avatar-engine drives MuseTalk lip-sync
+  - Classifies LLM responses and publishes motion state to Redis
+    so avatar-engine expression layer reacts
 """
 import asyncio
 import logging
-from typing import Optional
+from typing import AsyncIterable
 
 import numpy as np
 import redis.asyncio as aioredis
 from loguru import logger
 
-from livekit import agents
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
-from livekit.agents.llm import ChatContext, ChatMessage
-from livekit.agents.voice_assistant import VoiceAssistant
+from livekit import rtc
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    WorkerOptions,
+    cli,
+    stt as lk_stt,
+    tts as lk_tts,
+)
 from livekit.plugins import openai as lk_openai
-from livekit.plugins import deepgram as lk_deepgram
 from livekit.plugins import silero
 
 from app.config import settings
 from app.intent_classifier import classify, MotionState
 
-# Silence loguru + standard logging noise
 logging.getLogger("livekit").setLevel(logging.WARNING)
 
 REDIS_CHANNEL_AUDIO  = "avatar:audio:{session_id}"
 REDIS_CHANNEL_INTENT = "avatar:intent:{session_id}"
 
 
-class AvatarAudioInterceptor:
-    """
-    Wraps a TTS plugin and intercepts the audio output.
-    Publishes PCM chunks to Redis for the avatar engine.
-    """
-
-    def __init__(self, tts_plugin, redis: aioredis.Redis, session_id: str):
-        self._tts     = tts_plugin
-        self._redis   = redis
-        self._session_id = session_id
-        self._audio_channel = REDIS_CHANNEL_AUDIO.format(session_id=session_id)
-
-    async def synthesize(self, text: str):
-        """
-        Synthesize speech, publishing PCM chunks to Redis
-        as they arrive from the TTS stream.
-        """
-        async with self._tts.stream() as stream:
-            await stream.push_text(text)
-            await stream.mark_segment_end()
-
-            async for event in stream:
-                if not hasattr(event, "data") or event.data is None:
-                    continue
-                # event.data is a livekit AudioFrame
-                audio_frame = event.data
-                # Convert to float32 mono PCM at 16kHz for MuseTalk
-                pcm = np.frombuffer(audio_frame.data, dtype=np.int16).astype(np.float32)
-                pcm /= 32768.0  # normalize to [-1, 1]
-
-                # Resample to 16kHz if needed
-                if audio_frame.sample_rate != settings.AUDIO_SAMPLE_RATE:
-                    import librosa
-                    pcm = librosa.resample(
-                        pcm,
-                        orig_sr=audio_frame.sample_rate,
-                        target_sr=settings.AUDIO_SAMPLE_RATE,
-                    )
-
-                await self._redis.publish(self._audio_channel, pcm.tobytes())
-
-
 def _build_stt():
     if settings.STT_PROVIDER == "deepgram" and settings.DEEPGRAM_API_KEY:
+        from livekit.plugins import deepgram as lk_deepgram
         return lk_deepgram.STT(api_key=settings.DEEPGRAM_API_KEY)
-    # Default: OpenAI Whisper via LiveKit
     return lk_openai.STT(model="whisper-1", api_key=settings.OPENAI_API_KEY)
 
 
@@ -96,12 +56,14 @@ def _build_llm():
 
 def _build_tts():
     if settings.TTS_PROVIDER == "elevenlabs" and settings.ELEVENLABS_API_KEY:
-        from livekit.plugins import elevenlabs as lk_elevenlabs
-        return lk_elevenlabs.TTS(
-            api_key=settings.ELEVENLABS_API_KEY,
-            voice_id=settings.ELEVENLABS_VOICE_ID or "21m00Tcm4TlvDq8ikWAM",
-        )
-    # Default: OpenAI TTS
+        try:
+            from livekit.plugins import elevenlabs as lk_elevenlabs
+            return lk_elevenlabs.TTS(
+                api_key=settings.ELEVENLABS_API_KEY,
+                voice_id=settings.ELEVENLABS_VOICE_ID or "21m00Tcm4TlvDq8ikWAM",
+            )
+        except ImportError:
+            logger.warning("ElevenLabs plugin not installed — falling back to OpenAI TTS")
     return lk_openai.TTS(
         model="tts-1",
         voice="nova",
@@ -109,92 +71,113 @@ def _build_tts():
     )
 
 
+class AvatarAgent(Agent):
+    """
+    LiveKit Agent 1.x subclass.
+    Overrides tts_node to intercept audio chunks and forward
+    them to the avatar-engine via Redis pub/sub.
+    """
+
+    def __init__(self, redis: aioredis.Redis, session_id: str):
+        super().__init__(instructions=settings.AGENT_SYSTEM_PROMPT)
+        self._redis = redis
+        self._session_id = session_id
+        self._audio_channel = REDIS_CHANNEL_AUDIO.format(session_id=session_id)
+        self._intent_channel = REDIS_CHANNEL_INTENT.format(session_id=session_id)
+
+    async def on_enter(self):
+        """Called when agent becomes active in session. Send greeting."""
+        await asyncio.sleep(0.8)
+        await self.session.say(
+            "Hello! I'm your AI assistant. How can I help you today?",
+            allow_interruptions=True,
+        )
+
+    async def tts_node(
+        self,
+        text: AsyncIterable[str],
+        model_settings,
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        """
+        Override TTS node to intercept audio.
+        Runs default TTS, then for each AudioFrame:
+          1. Yields frame back to LiveKit (so user hears the voice)
+          2. Publishes raw PCM to Redis (so avatar-engine drives lip-sync)
+        """
+        # Collect text to classify intent before audio starts
+        text_buffer = []
+
+        async def tee_text():
+            async for chunk in text:
+                text_buffer.append(chunk)
+                yield chunk
+
+        async for audio_frame in Agent.default.tts_node(self, tee_text(), model_settings):
+            # Forward to LiveKit WebRTC (user hears the voice)
+            yield audio_frame
+
+            # Publish PCM to Redis for avatar lip-sync
+            try:
+                pcm = np.frombuffer(audio_frame.data, dtype=np.int16).astype(np.float32)
+                pcm /= 32768.0  # normalise to [-1, 1]
+
+                # Resample to 16kHz if needed (MuseTalk expects 16kHz)
+                if audio_frame.sample_rate != 16000:
+                    import librosa
+                    pcm = librosa.resample(
+                        pcm,
+                        orig_sr=audio_frame.sample_rate,
+                        target_sr=16000,
+                    )
+
+                await self._redis.publish(self._audio_channel, pcm.tobytes())
+            except Exception as e:
+                logger.warning(f"Audio publish error: {e}")
+
+        # After all audio is done, classify the full response and set motion state
+        if text_buffer:
+            full_text = "".join(text_buffer)
+            motion_state = classify(full_text)
+            try:
+                await self._redis.publish(self._intent_channel, motion_state.value)
+                logger.debug(f"Intent: {motion_state.value} | text: {full_text[:60]}...")
+            except Exception as e:
+                logger.warning(f"Intent publish error: {e}")
+
+
 async def entrypoint(ctx: JobContext):
     """
-    Called once per LiveKit room that the agent joins.
-    The session_id is passed via room metadata.
+    Called once per LiveKit room.
+    Room name convention: avatar-{session_id}
     """
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    await ctx.connect()
     logger.info(f"Agent joined room: {ctx.room.name}")
 
-    # Extract avatar session_id from room metadata
-    # Convention: room name = "avatar-{session_id}"
-    # Or set via room metadata
-    room_meta = ctx.room.metadata or ""
-    session_id = room_meta if room_meta else ctx.room.name.replace("avatar-", "")
+    # Extract session_id from room name
+    room_name = ctx.room.name or ""
+    session_id = room_name.replace("avatar-", "") if room_name.startswith("avatar-") else room_name
     logger.info(f"Avatar session_id: {session_id}")
 
-    # Redis connection
+    # Connect to Redis
     redis = await aioredis.from_url(
         settings.REDIS_URL,
         encoding="utf-8",
         decode_responses=False,
     )
-    intent_channel = REDIS_CHANNEL_INTENT.format(session_id=session_id)
 
-    # Build plugins
-    stt = _build_stt()
-    llm = _build_llm()
-    tts = _build_tts()
-    vad = silero.VAD.load()
+    # Build agent + session
+    agent = AvatarAgent(redis=redis, session_id=session_id)
 
-    # Initial chat context (system prompt)
-    initial_ctx = ChatContext(
-        messages=[
-            ChatMessage(
-                role="system",
-                content=settings.AGENT_SYSTEM_PROMPT,
-            )
-        ]
+    session = AgentSession(
+        vad=silero.VAD.load(),
+        stt=_build_stt(),
+        llm=_build_llm(),
+        tts=_build_tts(),
     )
 
-    # ── Custom TTS wrapper that intercepts audio for avatar ───
-    audio_interceptor = AvatarAudioInterceptor(tts, redis, session_id)
+    await session.start(agent=agent, room=ctx.room)
 
-    async def on_llm_response(text: str):
-        """
-        Called when LLM response text is ready (before TTS starts).
-        1. Classify intent → publish motion state
-        2. Synthesize + publish audio PCM
-        """
-        # Publish motion state immediately (async, no delay)
-        motion_state = classify(text)
-        await redis.publish(intent_channel, motion_state.value)
-        logger.debug(f"Intent: {motion_state.value} for: {text[:60]}...")
-
-        # TTS → PCM → Redis (streaming)
-        await audio_interceptor.synthesize(text)
-
-    # ── Voice Assistant ───────────────────────────────────────
-    assistant = VoiceAssistant(
-        vad=vad,
-        stt=stt,
-        llm=llm,
-        tts=tts,
-        chat_ctx=initial_ctx,
-        interrupt_speech_duration=0.5,
-        interrupt_min_words=2,
-        allow_interruptions=True,
-    )
-
-    # Hook into assistant events to intercept LLM output
-    @assistant.on("agent_speech_committed")
-    def on_speech_committed(msg: ChatMessage):
-        """Fires when assistant commits a spoken response."""
-        if msg.content:
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            asyncio.ensure_future(on_llm_response(text))
-
-    assistant.start(ctx.room)
-
-    # Greet the user
-    await asyncio.sleep(1)
-    await assistant.say(
-        "Hello! I'm your AI assistant. How can I help you today?",
-        allow_interruptions=True,
-    )
-
-    # Keep agent alive until room closes
+    # Keep alive until room disconnects
     await ctx.wait_for_disconnect()
 
     logger.info(f"Agent disconnecting from room: {ctx.room.name}")
