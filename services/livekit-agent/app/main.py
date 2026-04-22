@@ -6,9 +6,8 @@ Uses the modern AgentSession + Agent API.
 Pipeline: VAD → STT → LLM → TTS
 Additionally:
   - Intercepts TTS audio and publishes raw PCM to Redis
-    so avatar-engine drives MuseTalk lip-sync
+    so coefficient-engine drives lip-sync + behavior layer
   - Classifies LLM responses and publishes motion state to Redis
-    so avatar-engine expression layer reacts
 """
 import asyncio
 import logging
@@ -75,7 +74,7 @@ class AvatarAgent(Agent):
     """
     LiveKit Agent 1.x subclass.
     Overrides tts_node to intercept audio chunks and forward
-    them to the avatar-engine via Redis pub/sub.
+    them to the coefficient-engine via Redis pub/sub.
     """
 
     def __init__(self, redis: aioredis.Redis, session_id: str):
@@ -102,108 +101,96 @@ class AvatarAgent(Agent):
         Override TTS node to intercept audio.
         Runs default TTS, then for each AudioFrame:
           1. Yields frame back to LiveKit (so user hears the voice)
-          2. Publishes raw PCM to Redis (so avatar-engine drives lip-sync)
+          2. Publishes raw PCM to Redis (so coefficient-engine drives lip-sync)
         """
-        # Collect text to classify intent before audio starts
-        text_buffer = []
+        # Collect text to also classify intent
+        collected_text = []
 
-        async def tee_text():
+        async def _text_with_capture():
             async for chunk in text:
-                text_buffer.append(chunk)
+                collected_text.append(chunk)
                 yield chunk
 
-        async for audio_frame in Agent.default.tts_node(self, tee_text(), model_settings):
-            # Forward to LiveKit WebRTC (user hears the voice)
-            yield audio_frame
+        # Run TTS
+        tts = _build_tts()
+        async for frame in tts.stream(_text_with_capture(), model_settings):
+            # Forward to LiveKit
+            yield frame
 
-            # Publish PCM to Redis for avatar lip-sync
+            # Publish PCM to Redis for coefficient engine
             try:
-                pcm = np.frombuffer(audio_frame.data, dtype=np.int16).astype(np.float32)
-                pcm /= 32768.0  # normalise to [-1, 1]
-
-                # Resample to 16kHz if needed (MuseTalk expects 16kHz)
-                if audio_frame.sample_rate != 16000:
-                    import librosa
-                    pcm = librosa.resample(
-                        pcm,
-                        orig_sr=audio_frame.sample_rate,
-                        target_sr=16000,
-                    )
-
-                await self._redis.publish(self._audio_channel, pcm.tobytes())
+                # Convert audio frame to float32 PCM
+                pcm_data = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
+                await self._redis.publish(
+                    self._audio_channel,
+                    pcm_data.tobytes(),
+                )
             except Exception as e:
-                logger.warning(f"Audio publish error: {e}")
+                logger.error(f"Redis audio publish error: {e}")
 
-        # After all audio is done, classify the full response and set motion state
-        if text_buffer:
-            full_text = "".join(text_buffer)
-            motion_state = classify(full_text)
+        # After TTS completes, classify intent and publish
+        full_text = "".join(collected_text)
+        if full_text.strip():
+            intent = classify(full_text)
             try:
-                await self._redis.publish(self._intent_channel, motion_state.value)
-                logger.debug(f"Intent: {motion_state.value} | text: {full_text[:60]}...")
+                await self._redis.publish(
+                    self._intent_channel,
+                    intent.value,
+                )
             except Exception as e:
-                logger.warning(f"Intent publish error: {e}")
+                logger.error(f"Redis intent publish error: {e}")
 
 
 async def entrypoint(ctx: JobContext):
     """
-    Called once per LiveKit room.
-    Room name convention: avatar-{session_id}
+    Entry point for each LiveKit job (one per room/session).
     """
-    await ctx.connect()
-    logger.info(f"Agent joined room: {ctx.room.name}")
-
-    # Extract session_id from room name
+    # Extract session_id from room name: "avatar-{session_id}"
     room_name = ctx.room.name or ""
-    session_id = room_name.replace("avatar-", "") if room_name.startswith("avatar-") else room_name
-    logger.info(f"Avatar session_id: {session_id}")
+    if room_name.startswith("avatar-"):
+        session_id = room_name[len("avatar-"):]
+    else:
+        session_id = room_name or "unknown"
+
+    logger.info(f"Agent joining room: {room_name} (session: {session_id})")
 
     # Connect to Redis
-    redis = await aioredis.from_url(
-        settings.REDIS_URL,
-        encoding="utf-8",
-        decode_responses=False,
-    )
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
+    await redis.ping()
+    logger.info("Redis connected")
 
-    # Build agent + session
+    # Build the agent
     agent = AvatarAgent(redis=redis, session_id=session_id)
 
+    # Create agent session with pipeline
     session = AgentSession(
-        vad=silero.VAD.load(),
         stt=_build_stt(),
         llm=_build_llm(),
         tts=_build_tts(),
+        vad=silero.VAD.load(),
     )
 
+    # Start the session
     await session.start(agent=agent, room=ctx.room)
-    logger.info(f"AgentSession started for room: {ctx.room.name}")
 
-    # In livekit-agents 1.x, the framework manages process lifetime.
-    # session.start() registers everything; we keep the coroutine alive
-    # by listening for the room disconnect event. The framework cancels
-    # this task when the room closes.
-    disconnect_future = asyncio.Future()
+    # Wait for room disconnect
+    disconnect_event = asyncio.Event()
 
     @ctx.room.on("disconnected")
-    def _on_disconnect(*args):
-        if not disconnect_future.done():
-            disconnect_future.set_result(True)
+    def on_disconnect():
+        logger.info(f"Room disconnected: {room_name}")
+        disconnect_event.set()
 
-    try:
-        await disconnect_future
-    except asyncio.CancelledError:
-        pass
+    await disconnect_event.wait()
 
-    logger.info(f"Agent disconnecting from room: {ctx.room.name}")
+    # Cleanup
     await redis.close()
+    logger.info(f"Agent cleaned up for session {session_id}")
 
 
 if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            api_key=settings.LIVEKIT_API_KEY,
-            api_secret=settings.LIVEKIT_API_SECRET,
-            ws_url=settings.LIVEKIT_URL,
-        )
+        ),
     )

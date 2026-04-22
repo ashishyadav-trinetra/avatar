@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trinetralabs.ai/avatar/spec/v1",
+  "title": "Canonical Avatar Spec v1",
+  "description": "Contract defining the mesh format, blendshape order, and streaming protocol for the AI Avatar pipeline. All services (reconstruction, coefficient engine, frontend renderer) build against this spec.",
+  "type": "object",
+
+  "properties": {
+    "spec_version": {
+      "const": "1.0.0",
+      "description": "Semantic version of this spec"
+    },
+
+    "mesh": {
+      "type": "object",
+      "description": "GLB mesh requirements",
+      "properties": {
+        "format": { "const": "glb" },
+        "mesh_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$",
+          "description": "Version of the mesh generation pipeline that produced this avatar"
+        },
+        "topology": {
+          "type": "object",
+          "properties": {
+            "model": { "const": "FLAME_2020", "description": "FLAME parametric model version" },
+            "vertex_count": { "const": 5023, "description": "FLAME standard vertex count" },
+            "face_count": { "const": 9976, "description": "FLAME standard triangle count" }
+          },
+          "required": ["model", "vertex_count", "face_count"]
+        },
+        "neutral_pose": {
+          "type": "object",
+          "description": "Neutral pose definition — all blendshapes at 0, jaw closed, eyes forward",
+          "properties": {
+            "jaw_open": { "const": 0.0 },
+            "all_expressions_zero": { "const": true },
+            "eye_look": { "enum": ["forward"] },
+            "head_rotation": {
+              "type": "object",
+              "properties": {
+                "pitch": { "const": 0.0 },
+                "yaw": { "const": 0.0 },
+                "roll": { "const": 0.0 }
+              }
+            }
+          }
+        },
+        "coordinate_system": {
+          "type": "object",
+          "properties": {
+            "up": { "const": "+Y" },
+            "forward": { "const": "-Z" },
+            "units": { "const": "meters" },
+            "scale": { "type": "number", "description": "Head height in meters, ~0.23m typical" }
+          }
+        },
+        "checksum": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "description": "SHA-256 of the GLB binary for integrity verification"
+        }
+      },
+      "required": ["format", "mesh_version", "topology", "neutral_pose", "coordinate_system", "checksum"]
+    },
+
+    "blendshapes": {
+      "type": "object",
+      "description": "FLAME expression blendshapes (50 expression + 6 jaw = 56 total). Order is canonical — all services use this exact ordering.",
+      "properties": {
+        "count": { "const": 56 },
+        "expression_params": {
+          "type": "array",
+          "description": "50 FLAME expression parameters (exp_0 through exp_49)",
+          "prefixItems": [
+            { "const": "exp_0" }, { "const": "exp_1" }, { "const": "exp_2" },
+            { "const": "exp_3" }, { "const": "exp_4" }, { "const": "exp_5" },
+            { "const": "exp_6" }, { "const": "exp_7" }, { "const": "exp_8" },
+            { "const": "exp_9" }, { "const": "exp_10" }, { "const": "exp_11" },
+            { "const": "exp_12" }, { "const": "exp_13" }, { "const": "exp_14" },
+            { "const": "exp_15" }, { "const": "exp_16" }, { "const": "exp_17" },
+            { "const": "exp_18" }, { "const": "exp_19" }, { "const": "exp_20" },
+            { "const": "exp_21" }, { "const": "exp_22" }, { "const": "exp_23" },
+            { "const": "exp_24" }, { "const": "exp_25" }, { "const": "exp_26" },
+            { "const": "exp_27" }, { "const": "exp_28" }, { "const": "exp_29" },
+            { "const": "exp_30" }, { "const": "exp_31" }, { "const": "exp_32" },
+            { "const": "exp_33" }, { "const": "exp_34" }, { "const": "exp_35" },
+            { "const": "exp_36" }, { "const": "exp_37" }, { "const": "exp_38" },
+            { "const": "exp_39" }, { "const": "exp_40" }, { "const": "exp_41" },
+            { "const": "exp_42" }, { "const": "exp_43" }, { "const": "exp_44" },
+            { "const": "exp_45" }, { "const": "exp_46" }, { "const": "exp_47" },
+            { "const": "exp_48" }, { "const": "exp_49" }
+          ],
+          "minItems": 50,
+          "maxItems": 50
+        },
+        "jaw_params": {
+          "type": "array",
+          "description": "6 FLAME jaw/pose parameters",
+          "prefixItems": [
+            { "const": "jaw_0" }, { "const": "jaw_1" }, { "const": "jaw_2" },
+            { "const": "jaw_3" }, { "const": "jaw_4" }, { "const": "jaw_5" }
+          ],
+          "minItems": 6,
+          "maxItems": 6
+        },
+        "param_order": {
+          "description": "Canonical order in coefficient frames: expression[0..49] then jaw[0..5]",
+          "const": "expression_first"
+        },
+        "value_range": {
+          "type": "object",
+          "properties": {
+            "min": { "const": -3.0, "description": "FLAME params can go negative" },
+            "max": { "const": 3.0, "description": "Typical safe range" }
+          }
+        }
+      },
+      "required": ["count", "expression_params", "jaw_params", "param_order", "value_range"]
+    },
+
+    "head_pose": {
+      "type": "object",
+      "description": "Head rotation channels, streamed alongside blendshapes",
+      "properties": {
+        "channels": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "pitch" },
+            { "const": "yaw" },
+            { "const": "roll" }
+          ],
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "units": { "const": "radians" },
+        "value_range": {
+          "type": "object",
+          "properties": {
+            "min": { "const": -0.5236, "description": "~-30 degrees" },
+            "max": { "const": 0.5236, "description": "~+30 degrees" }
+          }
+        }
+      }
+    },
+
+    "eye_gaze": {
+      "type": "object",
+      "description": "Eye gaze direction channels",
+      "properties": {
+        "channels": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "gaze_left_h" },
+            { "const": "gaze_left_v" },
+            { "const": "gaze_right_h" },
+            { "const": "gaze_right_v" }
+          ],
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "units": { "const": "radians" }
+      }
+    },
+
+    "texture": {
+      "type": "object",
+      "description": "Texture map requirements",
+      "properties": {
+        "resolution": { "const": 1024, "description": "1024x1024 UV texture map" },
+        "format": { "const": "png" },
+        "uv_layout": { "const": "FLAME_standard" },
+        "texture_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "enhanced": {
+          "type": "boolean",
+          "description": "Whether super-resolution enhancement was applied"
+        }
+      },
+      "required": ["resolution", "format", "uv_layout", "texture_version"]
+    },
+
+    "streaming": {
+      "type": "object",
+      "description": "Coefficient streaming protocol over WebSocket",
+      "properties": {
+        "protocol": { "const": "ws" },
+        "frame_rate": { "const": 30, "description": "Target 30 FPS coefficient delivery" },
+        "frame_format": {
+          "type": "object",
+          "description": "Binary frame layout: header + coefficients",
+          "properties": {
+            "header": {
+              "type": "object",
+              "properties": {
+                "byte_0_3": { "const": "timestamp_ms", "description": "uint32 LE — server timestamp in ms" },
+                "byte_4": { "const": "flags", "description": "uint8 — bit 0: is_delta, bit 1: is_keyframe, bit 2: is_speaking" },
+                "byte_5": { "const": "sequence", "description": "uint8 — rolling sequence number 0-255" }
+              }
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "layout": {
+                  "const": "float32_le",
+                  "description": "Little-endian float32 array"
+                },
+                "channels": {
+                  "type": "array",
+                  "description": "Order of float32 values in payload",
+                  "items": { "type": "string" },
+                  "prefixItems": [
+                    { "const": "exp_0" }, { "const": "exp_1" }, { "const": "exp_2" },
+                    { "const": "exp_3" }, { "const": "exp_4" }, { "const": "exp_5" },
+                    { "const": "exp_6" }, { "const": "exp_7" }, { "const": "exp_8" },
+                    { "const": "exp_9" }, { "const": "exp_10" }, { "const": "exp_11" },
+                    { "const": "exp_12" }, { "const": "exp_13" }, { "const": "exp_14" },
+                    { "const": "exp_15" }, { "const": "exp_16" }, { "const": "exp_17" },
+                    { "const": "exp_18" }, { "const": "exp_19" }, { "const": "exp_20" },
+                    { "const": "exp_21" }, { "const": "exp_22" }, { "const": "exp_23" },
+                    { "const": "exp_24" }, { "const": "exp_25" }, { "const": "exp_26" },
+                    { "const": "exp_27" }, { "const": "exp_28" }, { "const": "exp_29" },
+                    { "const": "exp_30" }, { "const": "exp_31" }, { "const": "exp_32" },
+                    { "const": "exp_33" }, { "const": "exp_34" }, { "const": "exp_35" },
+                    { "const": "exp_36" }, { "const": "exp_37" }, { "const": "exp_38" },
+                    { "const": "exp_39" }, { "const": "exp_40" }, { "const": "exp_41" },
+                    { "const": "exp_42" }, { "const": "exp_43" }, { "const": "exp_44" },
+                    { "const": "exp_45" }, { "const": "exp_46" }, { "const": "exp_47" },
+                    { "const": "exp_48" }, { "const": "exp_49" },
+                    { "const": "jaw_0" }, { "const": "jaw_1" }, { "const": "jaw_2" },
+                    { "const": "jaw_3" }, { "const": "jaw_4" }, { "const": "jaw_5" },
+                    { "const": "pitch" }, { "const": "yaw" }, { "const": "roll" },
+                    { "const": "gaze_left_h" }, { "const": "gaze_left_v" },
+                    { "const": "gaze_right_h" }, { "const": "gaze_right_v" }
+                  ]
+                },
+                "total_floats": { "const": 63, "description": "50 exp + 6 jaw + 3 head + 4 gaze = 63" },
+                "total_bytes_payload": { "const": 252, "description": "63 * 4 bytes" },
+                "total_bytes_frame": { "const": 258, "description": "6 header + 252 payload" }
+              }
+            }
+          }
+        },
+        "jitter_buffer": {
+          "type": "object",
+          "properties": {
+            "min_frames": { "const": 2 },
+            "max_frames": { "const": 3 },
+            "strategy": { "const": "adaptive" }
+          }
+        },
+        "keyframe_interval": {
+          "const": 30,
+          "description": "Send full (non-delta) keyframe every 30 frames (1 second)"
+        },
+        "bandwidth": {
+          "type": "object",
+          "description": "Expected bandwidth at 30 FPS",
+          "properties": {
+            "raw_bytes_per_sec": { "const": 7740, "description": "258 * 30 = 7740 B/s" },
+            "delta_compressed_approx": { "const": 3000, "description": "~3 KB/s with delta encoding" }
+          }
+        }
+      },
+      "required": ["protocol", "frame_rate", "frame_format", "jitter_buffer", "keyframe_interval"]
+    },
+
+    "calibration": {
+      "type": "object",
+      "description": "Photo calibration requirements for reconstruction",
+      "properties": {
+        "required_shots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "description": { "type": "string" },
+              "angle": { "type": "string" },
+              "expression": { "type": "string" }
+            }
+          },
+          "prefixItems": [
+            { "properties": { "name": { "const": "front_neutral" }, "angle": { "const": "0deg" }, "expression": { "const": "neutral" } } },
+            { "properties": { "name": { "const": "left_quarter" }, "angle": { "const": "-30deg" }, "expression": { "const": "neutral" } } },
+            { "properties": { "name": { "const": "right_quarter" }, "angle": { "const": "+30deg" }, "expression": { "const": "neutral" } } },
+            { "properties": { "name": { "const": "front_mouth_open" }, "angle": { "const": "0deg" }, "expression": { "const": "mouth_open" } } },
+            { "properties": { "name": { "const": "front_smile" }, "angle": { "const": "0deg" }, "expression": { "const": "slight_smile" } } }
+          ],
+          "minItems": 5,
+          "maxItems": 6
+        },
+        "min_resolution": {
+          "type": "object",
+          "properties": {
+            "width": { "const": 512 },
+            "height": { "const": 512 }
+          }
+        },
+        "quality_gates": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Checks applied before reconstruction",
+          "prefixItems": [
+            { "const": "face_detected" },
+            { "const": "single_face" },
+            { "const": "face_size_adequate" },
+            { "const": "angle_matches_target" },
+            { "const": "sufficient_lighting" },
+            { "const": "no_occlusion" },
+            { "const": "expression_matches_target" }
+          ]
+        }
+      },
+      "required": ["required_shots", "min_resolution", "quality_gates"]
+    },
+
+    "service_interfaces": {
+      "type": "object",
+      "description": "Model-swappable service contracts",
+      "properties": {
+        "reconstruction": {
+          "type": "object",
+          "properties": {
+            "interface": { "const": "ReconstructionService" },
+            "input": { "const": "List[CalibrationPhoto]" },
+            "output": { "const": "AvatarBundle (GLB + metadata)" },
+            "implementations": {
+              "type": "array",
+              "items": { "type": "string" },
+              "prefixItems": [
+                { "const": "MICA" },
+                { "const": "DECA" },
+                { "const": "MICA+DECA" }
+              ]
+            }
+          }
+        },
+        "lip_sync": {
+          "type": "object",
+          "properties": {
+            "interface": { "const": "LipSyncService" },
+            "input": { "const": "AudioChunk (PCM 16kHz)" },
+            "output": { "const": "CoefficientFrame[]" },
+            "implementations": {
+              "type": "array",
+              "items": { "type": "string" },
+              "prefixItems": [
+                { "const": "FaceFormer" },
+                { "const": "CodeTalker" }
+              ]
+            }
+          }
+        },
+        "texture_enhancement": {
+          "type": "object",
+          "properties": {
+            "interface": { "const": "TextureEnhancer" },
+            "input": { "const": "RawTexture (DECA output)" },
+            "output": { "const": "EnhancedTexture (1024x1024 PNG)" },
+            "implementations": {
+              "type": "array",
+              "items": { "type": "string" },
+              "prefixItems": [
+                { "const": "RealESRGAN" },
+                { "const": "MultiViewBlend" }
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "required": ["spec_version", "mesh", "blendshapes", "head_pose", "eye_gaze", "texture", "streaming", "calibration", "service_interfaces"]
+}

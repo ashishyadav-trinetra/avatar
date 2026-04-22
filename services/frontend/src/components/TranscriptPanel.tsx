@@ -4,7 +4,7 @@ interface Props {
   lines: string[]
 }
 
-export function TranscriptPanel({ lines }: Props) {
+export function TranscriptPanel({ lines = [] }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {

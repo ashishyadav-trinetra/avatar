@@ -1,17 +1,18 @@
-version: "3.9"
-
 # ═══════════════════════════════════════════════════════════════
-#  AI Avatar POC — DEVELOPMENT compose
+#  AI Avatar — DEVELOPMENT compose (FLAME pipeline)
 #  docker compose -f docker-compose.dev.yml up
 #
-#  Key differences from prod:
-#  ─ avatar-engine runs in CPU/MOCK mode (no GPU required)
-#  ─ All services hot-reload on code changes via volume mounts
-#  ─ Frontend runs Vite dev server (HMR) instead of nginx build
-#  ─ Redis port exposed for local inspection
-#  ─ No GPU device reservation
-#  ─ avatar-engine bypasses MuseTalk model loading (stub frames)
-#  ─ Lighter resource limits
+#  Architecture:
+#  ─ reconstruction:     Photo → FLAME → GLB (port 8002)
+#  ─ coefficient-engine: Audio → coefficients via WebSocket (port 8003)
+#  ─ livekit-agent:      STT → LLM → TTS, publishes audio to Redis
+#  ─ api-gateway:        Session orchestration (port 8000)
+#  ─ frontend:           Three.js renderer + capture UI (port 3000)
+#  ─ redis:              Inter-service pub/sub
+#
+#  DEV_MODE=true uses stub models (no GPU needed):
+#  ─ StubReconstructor: generates placeholder GLB with morph targets
+#  ─ StubLipSync: audio energy → FLAME coefficients
 # ═══════════════════════════════════════════════════════════════
 
 networks:
@@ -20,6 +21,8 @@ networks:
 
 volumes:
   models:
+    driver: local
+  glb-outputs:
     driver: local
 
 services:
@@ -30,134 +33,157 @@ services:
     restart: unless-stopped
     networks: [avatar-net]
     ports:
-      - "6379:6379"          # exposed in dev for local inspection
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # ── Avatar Engine (CPU / DEV MODE) ────────────────────────
-  # Runs in DEV_MODE=true which bypasses MuseTalk model loading.
-  # Instead it generates animated placeholder frames using only
-  # MediaPipe + OpenCV so you can test the full pipeline without a GPU.
-  avatar-engine:
+  # ── Reconstruction Service ────────────────────────────────
+  # Takes calibration photos → produces GLB with FLAME morph targets
+  reconstruction:
     build:
-      context: ./services/avatar-engine
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: services/reconstruction/Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     ports:
-      - "8001:8001"
+      - "8002:8002"
     volumes:
       - models:/app/models
-      - ./services/avatar-engine:/app:rw  # hot reload
+      - glb-outputs:/app/outputs
+      - ./services/reconstruction:/app:rw
+      - ./libs:/app/libs:ro
     environment:
       - REDIS_URL=redis://redis:6379
       - MODEL_DIR=/app/models
       - DEVICE=cpu
-      - DEV_MODE=true               # ← skips MuseTalk, uses stub renderer
-      - FPS_TARGET=10               # lower fps on cpu
-      - FACE_SIZE=256
-      - USE_HALF_PRECISION=false
-      - ENABLE_UPSCALER=false
+      - DEV_MODE=true
+      - RECON_MODEL=stub
+      - GLB_OUTPUT_DIR=/app/outputs
       - LOG_LEVEL=debug
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 20s
 
-  # ── WebRTC Bridge ─────────────────────────────────────────
-  webrtc-bridge:
+  # ── Coefficient Engine ────────────────────────────────────
+  # Subscribes to TTS audio from Redis, runs lip-sync + behavior layer,
+  # streams binary coefficient frames via WebSocket at 30 FPS
+  coefficient-engine:
     build:
-      context: ./services/webrtc-bridge
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: services/coefficient-engine/Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     ports:
-      - "8002:8002"
-      - "50000-50010:50000-50010/udp"
+      - "8003:8003"
     volumes:
-      - ./services/webrtc-bridge:/app:rw   # hot reload
+      - models:/app/models
+      - ./services/coefficient-engine:/app:rw
+      - ./libs:/app/libs:ro
     environment:
       - REDIS_URL=redis://redis:6379
-      - AVATAR_ENGINE_URL=http://avatar-engine:8001
-      - STUN_SERVER=stun:stun.l.google.com:19302
-      - ANNOUNCE_IP=127.0.0.1
+      - DEVICE=cpu
+      - DEV_MODE=true
+      - LIPSYNC_MODEL=stub
+      - TARGET_FPS=30
       - LOG_LEVEL=debug
     depends_on:
-      avatar-engine:
+      redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   # ── LiveKit Agent ─────────────────────────────────────────
+  # STT → LLM → TTS pipeline. Publishes TTS audio to Redis
+  # for the coefficient engine to consume.
   livekit-agent:
     build:
-      context: ./services/livekit-agent
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: services/livekit-agent/Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
-    volumes:
-      - ./services/livekit-agent:/app:rw   # hot reload
     environment:
+      - REDIS_URL=redis://redis:6379
       - LIVEKIT_URL=${LIVEKIT_URL}
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - REDIS_URL=redis://redis:6379
-      - AGENT_SYSTEM_PROMPT=${AGENT_SYSTEM_PROMPT:-You are a helpful AI assistant. Be concise and conversational.}
-      - STT_PROVIDER=${STT_PROVIDER:-openai}
+      - STT_PROVIDER=${STT_PROVIDER:-deepgram}
       - TTS_PROVIDER=${TTS_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}
+      - AGENT_SYSTEM_PROMPT=${AGENT_SYSTEM_PROMPT:-You are a helpful AI assistant. Be concise and conversational.}
       - LOG_LEVEL=debug
     depends_on:
       redis:
         condition: service_healthy
 
   # ── API Gateway ───────────────────────────────────────────
+  # Session orchestration: creates sessions across reconstruction
+  # and coefficient engine, generates LiveKit tokens.
   api-gateway:
     build:
-      context: ./services/api-gateway
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: services/api-gateway/Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     ports:
       - "8000:8000"
     volumes:
-      - ./services/api-gateway:/app:rw     # hot reload
+      - glb-outputs:/app/outputs:ro
+      - ./services/api-gateway:/app:rw
     environment:
       - REDIS_URL=redis://redis:6379
       - LIVEKIT_URL=${LIVEKIT_URL}
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
-      - WEBRTC_BRIDGE_URL=http://webrtc-bridge:8002
-      - AVATAR_ENGINE_URL=http://avatar-engine:8001
-      - UPLOAD_DIR=/tmp/uploads
+      - RECONSTRUCTION_URL=http://reconstruction:8002
+      - COEFFICIENT_ENGINE_URL=http://coefficient-engine:8003
+      - GLB_OUTPUT_DIR=/app/outputs
       - LOG_LEVEL=debug
     depends_on:
       redis:
         condition: service_healthy
+      reconstruction:
+        condition: service_healthy
+      coefficient-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  # ── Frontend (Vite dev server with HMR) ───────────────────
+  # ── Frontend ──────────────────────────────────────────────
+  # Three.js renderer + photo capture UI.
+  # Loads GLB, connects to coefficient WebSocket, renders avatar.
   frontend:
     build:
-      context: ./services/frontend
-      dockerfile: Dockerfile.dev
+      context: .
+      dockerfile: services/frontend/Dockerfile.dev
     restart: unless-stopped
     networks: [avatar-net]
     ports:
       - "3000:3000"
     volumes:
       - ./services/frontend:/app:rw
-      - /app/node_modules             # don't override container node_modules
+      - /app/node_modules
     environment:
       - VITE_API_URL=http://localhost:8000
-      - VITE_WS_URL=ws://localhost:8000
-      - VITE_WEBRTC_URL=http://localhost:8002
-      - VITE_AVATAR_ENGINE_WS=ws://localhost:8001
+      - VITE_COEFF_WS_URL=ws://localhost:8003
+      - VITE_LIVEKIT_URL=${LIVEKIT_URL}
     depends_on:
       - api-gateway

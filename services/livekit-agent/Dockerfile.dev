@@ -11,12 +11,13 @@ RUN apt-get update && apt-get install -y ffmpeg gcc curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+
+COPY services/livekit-agent/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download livekit agent model files
 RUN python -m livekit.agents download-files || true
 
-COPY . .
+COPY services/livekit-agent/ .
 
 CMD ["python", "-m", "app.main", "start"]

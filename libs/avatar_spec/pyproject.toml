@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avatar-spec"
+version = "1.0.0"
+description = "Canonical avatar spec — shared constants, types, and frame codec"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]

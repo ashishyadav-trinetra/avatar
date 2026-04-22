@@ -1,0 +1,10 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+aiofiles==23.2.1
+redis[hiredis]==5.0.4
+numpy>=1.24
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0
+trimesh>=4.0.0
+# mediapipe is optional in dev — quality gate falls back to OpenCV Haar cascade

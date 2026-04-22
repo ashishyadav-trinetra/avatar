@@ -13,7 +13,10 @@ export interface SessionData {
   sessionId: string
   livekitToken: string
   livekitUrl: string
-  webrtcOfferUrl: string
+  glbUrl: string
+  coefficientWsUrl: string
+  model: string
+  reconstructionTimeMs: number
 }
 
 interface AvatarStore {

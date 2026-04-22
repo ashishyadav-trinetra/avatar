@@ -1,14 +1,17 @@
 """
-API Gateway — Main Application
-────────────────────────────────
-Single entry point for the React frontend.
-Handles:
-  POST /api/session/start   — upload photo, create avatar + LiveKit room
-  GET  /api/session/{id}    — session status
-  DELETE /api/session/{id}  — teardown
-  GET  /api/livekit/token   — generate LiveKit JWT for browser
+API Gateway — Session Orchestration for FLAME Avatar Pipeline
+──────────────────────────────────────────────────────────────
+Coordinates across reconstruction and coefficient-engine services.
+
+Endpoints:
+  POST /api/session/start     — upload photos, reconstruct avatar, start coeff session
+  POST /api/session/validate  — validate photos without reconstruction
+  GET  /api/session/{id}      — session status
+  DELETE /api/session/{id}    — teardown
+  GET  /api/avatar/{id}/glb   — download reconstructed GLB
   GET  /health
 """
+
 import asyncio
 import os
 import uuid
@@ -16,39 +19,49 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import aiohttp
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from loguru import logger
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from pydantic import Field
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 # ── Config ────────────────────────────────────────────────────
 class Settings(BaseSettings):
     REDIS_URL: str              = Field(default="redis://localhost:6379")
-    LIVEKIT_URL: str            = Field(...)
-    LIVEKIT_API_KEY: str        = Field(...)
-    LIVEKIT_API_SECRET: str     = Field(...)
-    WEBRTC_BRIDGE_URL: str      = Field(default="http://webrtc-bridge:8002")
-    AVATAR_ENGINE_URL: str      = Field(default="http://avatar-engine:8001")
-    UPLOAD_DIR: str             = Field(default="/tmp/uploads")
+    LIVEKIT_URL: str            = Field(default="wss://localhost:7880")
+    LIVEKIT_API_KEY: str        = Field(default="devkey")
+    LIVEKIT_API_SECRET: str     = Field(default="devsecret")
+    RECONSTRUCTION_URL: str     = Field(default="http://reconstruction:8002")
+    COEFFICIENT_ENGINE_URL: str = Field(default="http://coefficient-engine:8003")
+    GLB_OUTPUT_DIR: str         = Field(default="/app/outputs")
     LOG_LEVEL: str              = Field(default="info")
 
     class Config:
         env_file = ".env"
 
 settings = Settings()
-os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 
 
-# ── Pydantic models ───────────────────────────────────────────
+# ── Response models ──────────────────────────────────────────
 class StartSessionResponse(BaseModel):
     session_id: str
     livekit_token: str
     livekit_url: str
-    webrtc_offer_url: str
+    glb_url: str
+    coefficient_ws_url: str
+    reconstruction_time_ms: int
+    model: str
     status: str
+
+
+class ValidateResponse(BaseModel):
+    all_passed: bool
+    results: dict
 
 
 class SessionStatusResponse(BaseModel):
@@ -57,7 +70,7 @@ class SessionStatusResponse(BaseModel):
     avatar_ready: bool
 
 
-# ── LiveKit token generation ──────────────────────────────────
+# ── LiveKit token generation ─────────────────────────────────
 def generate_livekit_token(session_id: str, identity: str = "user") -> str:
     """Generate a LiveKit JWT for the browser to join the avatar room."""
     from livekit.api import AccessToken, VideoGrants
@@ -78,7 +91,7 @@ def generate_livekit_token(session_id: str, identity: str = "user") -> str:
     return token
 
 
-# ── HTTP client helper ────────────────────────────────────────
+# ── HTTP client ──────────────────────────────────────────────
 _http_session: Optional[aiohttp.ClientSession] = None
 
 async def get_http():
@@ -88,17 +101,17 @@ async def get_http():
     return _http_session
 
 
-# ── App ───────────────────────────────────────────────────────
+# ── App ──────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("API Gateway starting")
+    logger.info("API Gateway starting (FLAME pipeline)")
     yield
     if _http_session and not _http_session.closed:
         await _http_session.close()
     logger.info("API Gateway shutdown")
 
 
-app = FastAPI(title="Avatar API Gateway", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Avatar API Gateway", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,98 +121,182 @@ app.add_middleware(
 )
 
 
-# ── Routes ────────────────────────────────────────────────────
+# ── Routes ───────────────────────────────────────────────────
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "api-gateway"}
 
 
 @app.post("/api/session/start", response_model=StartSessionResponse)
-async def start_session(photo: UploadFile = File(...)):
+async def start_session(
+    front_neutral: UploadFile = File(...),
+    left_quarter: UploadFile = File(None),
+    right_quarter: UploadFile = File(None),
+    front_mouth_open: UploadFile = File(None),
+    front_smile: UploadFile = File(None),
+    skip_quality_check: bool = Form(False),
+):
     """
     Full session bootstrap:
-    1. Forward photo to avatar-engine → get session_id
-    2. Generate LiveKit token for browser
-    3. Return everything the browser needs
+    1. Forward photos to reconstruction service → GLB with morph targets
+    2. Create coefficient streaming session
+    3. Generate LiveKit token for voice pipeline
+    4. Return everything the frontend needs
     """
+    session_id = str(uuid.uuid4())
     http = await get_http()
 
-    # ── Forward photo to avatar-engine ───────────────────────
-    photo_bytes = await photo.read()
+    # ── Step 1: Reconstruct avatar ───────────────────────────
+    logger.info(f"[{session_id}] Starting reconstruction...")
+
     form = aiohttp.FormData()
-    form.add_field(
-        "photo",
-        photo_bytes,
-        filename=photo.filename or "avatar.jpg",
-        content_type=photo.content_type or "image/jpeg",
+    form.add_field("session_id", session_id)
+    form.add_field("skip_quality_check", str(skip_quality_check).lower())
+
+    # Forward all uploaded photos
+    uploads = {
+        "front_neutral": front_neutral,
+        "left_quarter": left_quarter,
+        "right_quarter": right_quarter,
+        "front_mouth_open": front_mouth_open,
+        "front_smile": front_smile,
+    }
+    for name, upload in uploads.items():
+        if upload is not None:
+            data = await upload.read()
+            if data:
+                form.add_field(
+                    name,
+                    data,
+                    filename=upload.filename or f"{name}.jpg",
+                    content_type=upload.content_type or "image/jpeg",
+                )
+
+    try:
+        async with http.post(
+            f"{settings.RECONSTRUCTION_URL}/reconstruct",
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status != 200:
+                error = await resp.text()
+                logger.error(f"[{session_id}] Reconstruction failed: {error}")
+                raise HTTPException(resp.status, f"Reconstruction failed: {error}")
+            recon_data = await resp.json()
+    except aiohttp.ClientError as e:
+        logger.error(f"[{session_id}] Reconstruction service unreachable: {e}")
+        raise HTTPException(503, f"Reconstruction service unreachable: {e}")
+
+    logger.info(
+        f"[{session_id}] Reconstruction complete: "
+        f"{recon_data['model']}, {recon_data['reconstruction_time_ms']}ms"
     )
 
-    async with http.post(
-        f"{settings.AVATAR_ENGINE_URL}/avatar/session",
-        data=form,
-    ) as resp:
-        if resp.status != 200:
-            body = await resp.text()
-            raise HTTPException(502, f"Avatar engine error: {body}")
-        engine_data = await resp.json()
-
-    session_id = engine_data["session_id"]
-    logger.info(f"Avatar engine session created: {session_id}")
-
-    # ── Generate LiveKit token ────────────────────────────────
+    # ── Step 2: Create coefficient session ───────────────────
     try:
-        lk_token = generate_livekit_token(session_id)
-    except Exception as e:
-        raise HTTPException(500, f"LiveKit token error: {e}")
+        async with http.post(
+            f"{settings.COEFFICIENT_ENGINE_URL}/sessions",
+            json={"session_id": session_id},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                error = await resp.text()
+                raise HTTPException(resp.status, f"Coefficient session failed: {error}")
+            coeff_data = await resp.json()
+    except aiohttp.ClientError as e:
+        raise HTTPException(503, f"Coefficient engine unreachable: {e}")
+
+    logger.info(f"[{session_id}] Coefficient session created")
+
+    # ── Step 3: Generate LiveKit token ───────────────────────
+    livekit_token = generate_livekit_token(session_id)
 
     return StartSessionResponse(
         session_id=session_id,
-        livekit_token=lk_token,
+        livekit_token=livekit_token,
         livekit_url=settings.LIVEKIT_URL,
-        webrtc_offer_url=f"{settings.WEBRTC_BRIDGE_URL}/webrtc/offer/{session_id}",
+        glb_url=f"/api/avatar/{session_id}/glb",
+        coefficient_ws_url=f"ws://localhost:8003/coefficients/ws/{session_id}",
+        reconstruction_time_ms=recon_data["reconstruction_time_ms"],
+        model=recon_data["model"],
         status="ready",
+    )
+
+
+@app.post("/api/session/validate", response_model=ValidateResponse)
+async def validate_photos(
+    front_neutral: UploadFile = File(None),
+    left_quarter: UploadFile = File(None),
+    right_quarter: UploadFile = File(None),
+    front_mouth_open: UploadFile = File(None),
+    front_smile: UploadFile = File(None),
+):
+    """Validate photos against quality gates without reconstruction."""
+    http = await get_http()
+
+    form = aiohttp.FormData()
+    uploads = {
+        "front_neutral": front_neutral,
+        "left_quarter": left_quarter,
+        "right_quarter": right_quarter,
+        "front_mouth_open": front_mouth_open,
+        "front_smile": front_smile,
+    }
+    for name, upload in uploads.items():
+        if upload is not None:
+            data = await upload.read()
+            if data:
+                form.add_field(name, data, filename=f"{name}.jpg", content_type="image/jpeg")
+
+    try:
+        async with http.post(
+            f"{settings.RECONSTRUCTION_URL}/validate",
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                error = await resp.text()
+                raise HTTPException(resp.status, error)
+            return await resp.json()
+    except aiohttp.ClientError as e:
+        raise HTTPException(503, f"Reconstruction service unreachable: {e}")
+
+
+@app.get("/api/avatar/{session_id}/glb")
+async def get_avatar_glb(session_id: str):
+    """Serve the reconstructed GLB file."""
+    glb_path = os.path.join(settings.GLB_OUTPUT_DIR, f"{session_id}.glb")
+    if not os.path.exists(glb_path):
+        raise HTTPException(404, "Avatar GLB not found")
+    return FileResponse(
+        glb_path,
+        media_type="model/gltf-binary",
+        filename=f"avatar_{session_id}.glb",
     )
 
 
 @app.delete("/api/session/{session_id}")
 async def end_session(session_id: str):
-    """Tear down avatar engine session + WebRTC peer connection."""
+    """Teardown a session: stop coefficient streaming."""
     http = await get_http()
 
-    results = await asyncio.gather(
-        http.delete(f"{settings.AVATAR_ENGINE_URL}/avatar/session/{session_id}"),
-        http.delete(f"{settings.WEBRTC_BRIDGE_URL}/webrtc/session/{session_id}"),
-        return_exceptions=True,
-    )
-
-    errors = [str(r) for r in results if isinstance(r, Exception)]
-    if errors:
-        logger.warning(f"Session teardown errors: {errors}")
-
-    return {"status": "ended", "session_id": session_id}
-
-
-@app.get("/api/session/{session_id}/status", response_model=SessionStatusResponse)
-async def session_status(session_id: str):
-    http = await get_http()
+    # Stop coefficient session
     try:
-        async with http.get(f"{settings.AVATAR_ENGINE_URL}/health") as r:
-            engine_ok = r.status == 200
-    except Exception:
-        engine_ok = False
-
-    return SessionStatusResponse(
-        session_id=session_id,
-        status="active" if engine_ok else "degraded",
-        avatar_ready=engine_ok,
-    )
-
-
-@app.get("/api/livekit/token")
-async def livekit_token(session_id: str, identity: Optional[str] = "user"):
-    """Generate a fresh LiveKit token (for reconnects)."""
-    try:
-        token = generate_livekit_token(session_id, identity)
-        return {"token": token, "url": settings.LIVEKIT_URL}
+        async with http.delete(
+            f"{settings.COEFFICIENT_ENGINE_URL}/sessions/{session_id}",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            pass
     except Exception as e:
-        raise HTTPException(500, str(e))
+        logger.warning(f"[{session_id}] Error stopping coefficient session: {e}")
+
+    # Clean up GLB file
+    glb_path = os.path.join(settings.GLB_OUTPUT_DIR, f"{session_id}.glb")
+    if os.path.exists(glb_path):
+        try:
+            os.remove(glb_path)
+        except Exception:
+            pass
+
+    return {"session_id": session_id, "status": "ended"}

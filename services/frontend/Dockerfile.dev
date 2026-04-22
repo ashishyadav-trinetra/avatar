@@ -8,7 +8,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Install deps into the image layer (not the mounted volume)
-COPY package*.json ./
+COPY services/frontend/package*.json ./
 RUN npm install
 
 # Source files will be mounted at /app by docker-compose volume
